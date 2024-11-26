@@ -80,7 +80,7 @@ _Este trabajo fue realizado por:_
 * **Renata Sandoval** - *Trabajo Inicial* - [villanuevand](https://github.com/rensanch)
 * **Victoria Lelis** - *Trabajo Inicial* - [VictoriaLelis](https://github.com/VictoriaLelis)
 
-También puedes mirar la lista de todos los [contribuyentes](https://github.com/your/project/contributors) quíenes han participado en este proyecto. 
+
 
 
 
