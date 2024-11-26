@@ -49,24 +49,28 @@ Los datos utilizados en este proyecto provienen del conjunto de datos **GSE48166
 ## Estructura del proyecto 📁
 El proyecto se divide en cuatro partes principales:
 1. **Descarga de datos y carga de librerías:**
-    a. Reducción de dimensionalidad del dataset con GSVA
+    * Reducción de dimensionalidad del dataset con GSVA
+
 2. **Selección del conjunto de datos y análisis inicial:**
-    a. Documentación del conjunto de datos
-    b. Análisis Exploratorio de Datos
-    c. Análisis de reducción de dimensionalidad
-    d. Relevancia biológica
+    * Documentación del conjunto de datos
+    * Análisis Exploratorio de Datos
+    * Análisis de reducción de dimensionalidad
+    * Relevancia biológica
+
 3. **Enfoque de Machine Learning:**
-   a. Formulación del problema
-   b. Implementación del modelo
-   c. Ingeniería de características
+   * Formulación del problema
+   * Implementación del modelo
+   * Ingeniería de características
+
 4. **Revisión de la Literatura:**
-   a. Análisis de la literatura primaria
-   b. Comparación de Métodos
+   * Análisis de la literatura primaria
+   * Comparación de Métodos
+
 5. **Resultados e Implementación:**
-   a. Aplicaicón Técnica
-   b. Análisis de resultados
-   c. Perspectiva biológica
-   d. Futuras direcciones de investigación
+   * Aplicaicón Técnica
+   * Análisis de resultados
+   * Perspectiva biológica
+   * Futuras direcciones de investigación
 
 
 ## Autores ✒️
