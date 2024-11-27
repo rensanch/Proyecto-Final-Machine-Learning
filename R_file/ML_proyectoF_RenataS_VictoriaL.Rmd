@@ -1,0 +1,1206 @@
+---
+title: "Machine Learning in Genomics - Proyecto Final"
+author: "Victoria Lelis & Renata Sandoval"
+output:
+  pdf_document:
+    toc: true
+    number_sections: true
+    fig_width: 5
+    fig_height: 4
+    fig_caption: true
+  word_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: true
+---
+
+# **Descarga de datos y carga de librerías**
+```{r message=FALSE, warning=FALSE}
+rm(list=ls())
+library(DataExplorer)
+library(skimr)
+library(ggplot2)
+library(GGally)
+library(tidyverse)
+library(tidymodels)
+library(corrplot)
+library(dplyr) 
+library(nnet)
+library(yardstick)
+library(viridis)
+library(vip)
+library(recount3)
+library(tidyr)
+library(GSVA)
+library(GSVAdata)
+library(msigdbr)
+library(SummarizedExperiment)
+library(pheatmap)
+library(patchwork)
+theme_set(theme_minimal(base_size = 8))
+```
+
+Ocupamos la librería `recount3 ()` para hacer la descarga de nuestros datos, ocupamos el proyecto **SRP026208**.
+
+```{r message=FALSE, warning=FALSE, include=FALSE, results='hide'}
+# obtener los proyectos disponibles
+project_info <- available_projects()
+
+# escoger el proyecto con el ID "SRP026208"
+project <- project_info %>%
+  dplyr::filter(project == "SRP026208")
+
+# crear un objeto RSE
+rse <- create_rse(project)
+
+# transformar los counts a log2(TPM + 1)
+assay(rse, "counts") <- transform_counts(rse)
+expr_matrix <- assay(rse, "counts")
+e_matr <- as.data.frame(expr_matrix)
+```
+
+
+## **Reducción de dimensionalidad del dataset con GSVA**
+
+Dado que nuestro data frame es demasiado extenso para los análisis posteriores, reducimos su dimensionalidad utilizando GSVA (Gene Set Variation Analysis). Esta herramienta permite asociar los datos de expresión génica con diversos **pathways biológicos** y asignar un puntaje que refleja la actividad del conjunto de genes en cada ruta.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, results='hide'}
+##Loading Pathways
+c2_gene_sets <- msigdbr(species = "Homo sapiens", ##cargando canonical pathways
+                        category = "C2",
+                        subcategory = "CP") %>%
+  dplyr::select(gs_name, gene_symbol) %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+print(paste("Number of pathways:", length(c2_gene_sets)))
+
+##Data Processing Steps
+# Match gene symbols
+gene_symbols <- rowData(rse)$gene_name
+rownames(expr_matrix) <- gene_symbols
+# Remove NA and duplicate symbols
+expr_matrix <- expr_matrix[!is.na(rownames(expr_matrix)), ]
+expr_matrix <- expr_matrix[!duplicated(rownames(expr_matrix)), ]
+
+##Running GSVA
+# Set up GSVA parameters
+gsvaPar <- GSVA::gsvaParam(expr = expr_matrix,
+                          geneSets = c2_gene_sets,
+                          kcdf = "Gaussian")
+
+##GSVA Execution
+# Run GSVA
+gsva_results <- gsva(gsvaPar, verbose=FALSE)
+
+# Cambimos las columnas por las filas, esto para que en las filas estén los pacientes 
+# y en las columnas los pathways
+final_data <- as.data.frame(t(gsva_results))
+
+# Por último, agregamos una columna que indique la condición de cada paciente:
+    # crear un vector en donde vengan las condiciones de cada paciente
+vec = c("control", "control", "control", "control", "control", "control","control",
+        "control","control","control","control","control","control","control",
+        "control","ICM","ICM","ICM","ICM","ICM","ICM","ICM",
+        "ICM","ICM","ICM","ICM","ICM","ICM","ICM", "ICM")
+
+final_data <- cbind(condition = vec, final_data)
+
+##Verificando el tipo de dato
+final_data$condition = factor(final_data$condition)
+str(final_data)
+```
+
+
+# **Parte 1: Selección del conjunto de datos y análisis inicial**
+
+## **Documentación del conjunto de datos**
+
+### - Describa detalladamente el conjunto de datos genómicos seleccionado:
+
+#### **¿Cuál es la fuente y el número de acceso (si procede)?**c
+El accession number del dataset utilizado para este proyecto es GSE48166. Aunque este dataset no cuenta con un artículo asociado, es posible acceder a los datos directamente mediante la herramienta `recount3`. Puedes acceder a los datos del experimento en el siguiente link: \href{https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE48166}{\underline{GEO-GSE48166}}.
+
+
+#### **¿De qué tipo de datos se trata (RNA-seq, ChIP-seq, microarrays, etc.)?**\newline
+El dataset contiene datos de **RNA-seq**, específicamente, **expr_matrix** incluye los perfiles de expresión génica de cada paciente involucrado en este estudio.
+
+#### **¿Cuántas muestras y características contiene?**\newline
+En este dataset tenemos un total de 29 **biological pathways**  y una variable de la condición del paciente (columnas), y en el caso de las muestras tenemos 30 pacientes (columnas), de los cuales 15 pacientes presentan **miocardiopatía isquémica**, y los otros 15 pacientes son del grupo control (personas saludables).
+
+```{r echo=FALSE}
+num_var = ncol(final_data)
+num_sample = nrow(final_data)
+
+cat(sprintf("Número de columnas: %d\nNúmero de filas: %d", ncol(final_data), nrow(final_data)))
+```
+
+#### **¿Cuál es la cuestión biológica que se aborda?**\newline
+La insuficiencia cardíaca es un problema grave que afecta a millones de personas en todo el mundo. Esta enfermedad puede clasificarse en diferentes tipos según sus causas, las cuales suelen ser variadas y complejas de identificar. Comprender los diversos tipos de insuficiencia cardíaca podría aportar información valiosa para desarrollar tratamientos más especializados, mejorando así el pronóstico de los pacientes. Siendo un primer acercamiento en este proyecto el detectar si los pacientes presentan **miocardiopatía isquémica**, un tipo de insuficiencia cardíaca.
+
+## **Análisis Exploratorio de Datos**
+
+### - Realice y documente un AED exhaustivo:
+
+#### **Generar e interpretar gráficos de distribución de características clave:**\newline
+Los plots nos dan información sobre cómo se distribuyen los datos de cada una de las variables (genes) de nuestro dataset. Para realizar estos análisis ocupamos: 
+```{r create report}
+#create_report(final_data)
+```
+
+ En este caso podemos observar cómo están dsitribuidos los valores de cada una de los pathways biológicos.
+
+![Histograma 1 de la distribución de los datos de los genes](images/img1.png)
+
+![Histograma 2 de la distribución de los datos de los genes](images/img2.png)
+
+De la misma exploración obtuvimos un Análisis de Componentes Principales realizado por la misma función `create_report()`. Esta revisión nos permitió darnos una idea de cómo esperamos que se organizen los datos; una opción sería comparar nuestros resultados con este plot para identificar posibles diferencias entre ambos.\newline 
+
+![PCA realizado con DataExplorer](images/img3.png)
+
+Por otro lado, `skim ()` nos da información como el número de columnas (genes) y filas (pacientes); al igual que el tipo de varibles, en su mayoría numéricas, excepto `condition`. También nos da si es que hay valores faltantes (los cuales no hay), el promedio de cada variable, su desviación estándar, entre otros datos.
+```{r}
+# skim(final_data)
+```
+
+#### **Analiza potenciales batch effects o artefactos técnicos**\newline
+Para analizar posibles batch effects o artefactos técnicos es bueno primero comenzar con la evaluación de la variabilidad de los datos, por medio de métodos como el Principal Component Analysis (PCA), que se realizará más adelante. Como vimos durante clase, el PCA nos permite identificar patrones en los datos que pueden no estar relacionados con las condiciones biológicas, sino que se trata de artefactos técnicos, como podría ser variaciones en el procesamiento que se les dio a las muestras.
+
+#### **Evaluar la calidad de los datos y los valores que faltan.**\newline
+Al evaluar los datos faltantes de nuestro dataset, obtuvimos el siguiente plot, igualmente proviene de la función `create_report()`. Como podemos observar, no tenemos ningún valor faltante, lo que es un muy buen indicador de la calidad de nuestros datos.\newline
+![Missing Data](images/img4.png)
+
+#### **Visualizar las relaciones entre características**\newline
+En la siguiente matriz tenemos una vista general de las relaciones que hay entre las variables (genes). Observamos una barra de color que nos indica el tipo de correlación, si es roja, indica que hay una correlación positiva (valores cercanos a 1). Cuando se tiene un color azul, indica una correlación negativa (valores cercanos a -1); finalmente cuando se obseva de un color blanco, señala que no se detectó ninguna correlación. A pesar de que en el eje X no podemos diferenciar de qué pathway biológico estamos hablando, en una vista general podemos observar que la mayoría de las regiones son de color rojo, es decir, presentan correlaciones positivas.
+
+![Matriz de correlacion](images/img5.png)
+
+## **Análisis de reducción de dimensionalidad **
+
+### **Realizar el análisis de componentes principales**
+
+```{r echo=FALSE}
+## Receta para normalizar predictores y asignar roles a las variables
+
+#submuestreo 
+data_recipe_pca <-
+  recipe(~., data = final_data) %>% ##Especificando que variables eran predictores con 
+                                      #Recipe "en este caso todas"
+  update_role(condition, new_role= "outcome") %>% #Nuestra variable que queremos predecir
+  step_naomit(all_numeric_predictors()) %>% #Elimina las filas que contengan NA en las 
+                                            #variables que fueron designadas como 
+                                            #predictoras (solo se necesita un na para 
+                                            #eliminar la fila)
+  
+# Add step to normalize predictors# Add step to perform PCA
+  step_normalize(all_predictors()) %>% #Normalizando los predictores
+  step_pca(all_predictors(),id = "pca") %>% #Ayuda a simplificar el modelo sin perder 
+                                            #informacion clave
+  prep()
+
+pca_prep <- prep(data_recipe_pca) 
+
+#Observar que hay en pca
+data_pca <-
+  pca_prep %>%
+  tidy(id = "pca") #Convierte los datos de un modelo estadistico a un formato mas limpio
+                   #el id da un identificador unico a los resultados de modelos
+
+print(data_pca)
+```
+
+#### **Creación de un "scree plot" para observar la proporción de varianza explicada por cada componente principal.**\newline
+
+```{r echo=FALSE}
+data_recipe_pca %>%
+  tidy(id = "pca", type = "variance") %>%
+  # Filter for percent variance# Create a ggplot
+  filter(terms == "percent variance") %>%
+  ggplot(aes(x = component, y = value)) + 
+  geom_col(fill= "pink1" ) +
+  theme_minimal() +
+  labs(
+    title = "Análisis de Componentes Principales (PCA)",
+    x = "Número de Componentes",
+    y = "Valor")
+```
+
+
+#### **Visualizar la contribución de cada variable en cada PC.**\newline
+```{r echo=FALSE}
+data_pca %>%
+  # mutate(terms = tidytext::reorder_within(terms, 
+  #                                         abs(value), 
+  #                                         component)) %>%
+  ggplot(aes(abs(value), terms, fill = value > 0)) +
+  geom_col() +
+  facet_wrap(~component, scales = "free_y") +
+  # tidytext::scale_y_reordered() +
+  scale_fill_manual(values = c("rosybrown1", "palevioletred2")) +
+  labs(
+    x = "Valor absoluto de la contribución",
+    y = NULL, fill = "Positive?") 
+```
+
+Dado que es poco posible visualizar todos los PC, se seleccionó los primeros 5 componentes principales, ya que entre estos parece estar aproximadamente el 90% de la variabilidad total de los datos (90% de la información total):\newline
+
+```{r 5 PCA, echo=FALSE, fig.width=7, fig.height=6}
+top_4_pcs <- data_pca %>%
+  filter(component %in% c("PC1", "PC2", "PC3", "PC4"))
+
+# Filtrar los datos para cada componente
+component_1 <- top_4_pcs %>% filter(component == "PC1")
+component_2 <- top_4_pcs %>% filter(component == "PC2")
+component_3 <- top_4_pcs %>% filter(component == "PC3")
+component_4 <- top_4_pcs %>% filter(component == "PC4")
+
+# (PC1)
+ggplot(component_1, aes(abs(value), terms, fill = value > 0)) +
+  geom_col() +
+  scale_fill_manual(values = c("rosybrown1", "palevioletred2")) +
+  labs(
+    title = "Componente Principal 1",
+    x = "Valor absoluto de la contribución",
+    y = NULL, fill = "Indicador"
+  ) +
+  theme_minimal()
+```
+
+
+```{r echo=FALSE, fig.width=7, fig.height=6}
+# (PC2)
+ggplot(component_2, aes(abs(value), terms, fill = value > 0)) +
+  geom_col() +
+  scale_fill_manual(values = c("rosybrown1", "palevioletred2")) +
+  labs(
+    title = "Componente Principal 2",
+    x = "Valor absoluto de la contribución",
+    y = NULL, fill = "Indicador"
+  ) +
+  theme_minimal()
+```
+
+
+```{r echo=FALSE, fig.width=7, fig.height=6}
+# (PC3)
+ggplot(component_3, aes(abs(value), terms, fill = value > 0)) +
+  geom_col() +
+  scale_fill_manual(values = c("rosybrown1", "palevioletred2")) +
+  labs(
+    title = "Componente Principal 3",
+    x = "Valor absoluto de la contribución",
+    y = NULL, fill = "Indicador"
+  ) +
+  theme_minimal()
+```
+
+
+```{r echo=FALSE, fig.width=7, fig.height=6}
+# (PC4)
+ggplot(component_4, aes(abs(value), terms, fill = value > 0)) +
+  geom_col() +
+  scale_fill_manual(values = c("rosybrown1", "palevioletred2")) +
+  labs(
+    title = "Componente Principal 4",
+    x = "Valor absoluto de la contribución",
+    y = NULL, fill = "Indicador"
+  ) +
+  theme_minimal()
+```
+
+
+#### **Justifica el número de componentes seleccionados:**\newline
+Se seleccionó los primeros 4 componentes principales, ya que entre estos parece estar aproximadamente el 90% de la variabilidad total de los datos (90% de la información total). Aunque también podríamos conservar solo los primeros 3 componentes, ya que en estos 3 se encuentra entre el aproximadamente el 80% de la información total.
+
+#### **Vizualiza e interpreta los primeros 2-3 componentes principales:**\newline
+En los componentes principales 1-2 se observa una buena separación de los grupos, se podría pensar que dicha separación no es tan obvia pero esto puede ser una consecuencia de la cantidad de muestras, sin embargo, como ya se mencionó se ve una clara separación de los dos grupos. De igual modo, dicha distinción entre los grupos se observa entre los componentes principales 2-3. Con estos resultados parece que incluso podríamos quedarnos con 3 componentes.
+
+```{r echo=FALSE}
+pca_results <- bake(pca_prep, new_data = NULL)
+
+ggplot(pca_results, aes(PC1, PC2, color = condition)) +
+  geom_point(alpha = 0.7, size = 3) +
+  labs(color = "Condición")+
+  theme_minimal()
+
+```
+
+```{r echo=FALSE}
+ggplot(pca_results, aes(PC2, PC3, color = condition)) +
+  geom_point(alpha = 0.7, size = 3) +
+  labs(color = "Condición") +
+  theme_minimal()
+```
+
+
+#### **Calcular y graficar la proporción de varianza explicada:**\newline
+Como se observa en el punto 2, el PC1 explica aproximadamente el 50% de la varianza, en el PC2 se explica aproximadamente el 120%, y en los siguentes PCs esta varianza explicada sigue disminuyendo, con esto podemos supoener que el 80-90% de la varianza se encuentra entre los primeros 3 o 4 componentes principales.
+
+#### **Identificar las características con las mayores cargas en los componentes principales:**\newline
+Observando el punto 4 podemos observar; primero que el PC1 explica el 50% de la varianza. Centrandonos es este PCs podemos observar que las rutas que más aportan a este PC son:
+
+```{r echo=FALSE}
+top_5_vars <- data_pca %>%
+  filter(component == "PC1") %>%        # Filtrar exclusivamente PC1
+  arrange(desc(abs(value))) %>%         # Ordenar por valor absoluto de contribución
+  slice_head(n = 5)                     # Seleccionar las 5 variables principales
+                                # Seleccionar las 5 variables principales
+
+# Mostrar las variables principales
+print(top_5_vars)
+```
+
+#### **Discutir la importancia biológica de los resultados del PCA :**\newline
+
+El análisis de componentes principales (PCA) muestra una separación clara entre los dos grupos que queremos predecir en modelos posteriores. Esto sugiere que las rutas biológicas utilizadas como variables en el análisis tienen diferentes niveles de actividad dependiendo de la condición del paciente, lo que ayuda a distinguir entre los grupos. También podemos observar que dos de las rutas biológicas que resultaron importantes en el PC1 están relacionadas directamente con funciones cardíacas: **SIG_PIP3_SIGNALING_IN_CARDIAC_MYOCYTES** que contiene **genes relacionados con la señalización de PIP3 en miocitos cardíacos**, esta vía "regula múltiples procesos clave en los miocitos cardíacos, incluyendo el tamaño celular, la supervivencia, la angiogénesis y la inflamación, tanto en casos de hipertrofia cardíaca fisiológica como patológica" (Aoyagi & Matsui, 2011). y **SIG_INSULIN_RECEPTOR_PATHWAY_IN_CARDIAC_MYOCYTES** o **la señalización de la insulina**, esta vía "regula el crecimiento cardíaco, la supervivencia, la captación y uso de sustratos y el metabolismo mitocondrial. Además, modula las respuestas del corazón frente a estresores tanto fisiológicos como patológicos" (Abel, 2021). Estas vías tienen roles cruciales en la fisiología y homeostasis del tejido cardíaco.
+
+#### **Identidica batch effects en el espacio visible del PCA:**\newline
+Al analizar la proyección de las muestras en los primeros tres componentes principales (PCs), no se observan patrones inesperados o agrupaciones extrañas que sugieran la presencia de batch effects. Las muestras se agrupan según lo esperado, con una diferencia entre los grupos de control y los de ICM (insuficiencia cardíaca).
+
+Además, las variables que contribuyen significativamente al PC1 están estrechamente relacionadas con procesos biológicos cardíacos. Esto refuerza la idea de que el PCA está capturando diferencias biológicas relevantes en lugar de artefactos técnicos.
+
+En resumen, no se evidencian efectos de batch en el análisis de componentes principales, lo que indica que los datos son consistentes y aptos para su uso en análisis posteriores.
+
+
+## **Relevancia biológica**
+
+#### **1. Explique cómo este conjunto de datos y su análisis contribuirán al campo.**\newline
+Este conjunto de datos y su análisis con un enfoque con Machine Learning, contribuirán a identificar patrones transcriptómicos que ayuden a diferenciar entre paciente sanos y aquellos que padecen cardiomiopatía isquémica (ICM). Ocupando datos de expresión génica, este trabajo busca clasificar entre estos dos gurpos, además que esperamos que provee información sobre genes y vías de regularización que sean clave en esta enfermedad, lo que contribuirá a investigaciones y tratamientos futuros.
+
+#### **2. Describa las posibles implicaciones clínicas o de investigación.**\newline
+El trabajo que deasrrollamos no buscar hacer un diagnóstico clínico en el que pueda basarse para iniciar un tratamiento. La implicación clínica de este proyecto es ser capaces de identificar a pacaiente sanos de aquellos que presentan insuficiencias cardíacas. Haremos la clasificación entre paciente "sano" y con "ICM" en base a los genes, los cuales ocuparemos como predictores.
+
+#### **3. Identifique cualquier limitación del conjunto de datos que pueda afectar a su análisis.**\newline
+La principal limitación que observamos fue el tamaño de la muestra, ya que solamente tenemos datos ded 30 pacientes. Esto podría significar un potencial problema, ya que un tamaño de muestra tan pequeño puede limitar la generalización de los resultados, lo que a su vez aumentaría la probabilidad de sesgo en las predicciones.
+
+
+
+# **Parte 2: Enfoque de Machine Learning**
+## **Formulación del problema**
+
+#### **Exponga claramente su objetivo de Machine Learning.**\newline
+En objetivo de este proyecto de Machine Learning es desarrollar un modelo que se capaz de predecir si una persona es sana o si presenta cardiomiopatía isquémica (ICM). Ocuapremos datos de expresión génica como predictores.
+
+#### **Justifique por qué el Machine Learning es apropiado para este problema.**\newline
+El enfoque de Machine Learning es bueno porque nos permite hacer una reducción en la dimensionalidad del dataset, ocupando técnicas como el PCA, lo que nos permite manejar los datos que tienen dimensiones grandes sin perder información importante. Además, nos permite hacer clasificación, que es el enfoque que vamos a realizar, entrenando modelos predictivos en conjuntos de entrenamiento y prueba. Por último, algoritmos de Machine Learning nos permiten identificar las variables más importantes para realizar las predicciones, lo que nos proporcionaría información sobre los genes que podrían estar relacionados con la ICM.
+
+#### **Explique su elección de enfoque supervisado/sin supervisión.**\newline
+Nosotras decidimos ocupar un enfoque supervisado, esto porque se buscó entrenar un modelo en base a los genes. Sumando que, la clasificación (identificar si la persona es sana o presenta cardiomiopatía isquémica) forma parte de este enfoque.
+
+#### **Describa cómo evaluará el éxito.**\newline
+Nosotras evaluamos el éxito como: dados los genes, el modelo será capaz de hacer una predicción para identificar si la persona está sana o muestra ICM.
+
+
+
+## **Implementación del modelo**
+### **Regresión Logística Regularizada**
+
+Realizamos tres modelos de regresión logística rgularizada:\newline
+  - Lasso\newline
+  - Ridge\newline
+  - Elastic Net\newline
+
+```{r REGRESION LOGISTICA, include=FALSE}
+# El primer paso que realizamos fue separar el dataset entre: entrenamiento y prueba.
+
+heart_split <- initial_split(final_data, prop = 0.8, strata = condition)
+heart_train <- training(heart_split)
+heart_test <- testing(heart_split)
+
+# Ahora crearemos una receta de pre-procesamiento, aquí normalizaremos los datos y 
+# crearemos variables "dummy".
+heart_recipe <- recipe(condition ~ ., data = heart_train) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors()) 
+```
+
+
+
+```{r regresion logistica REGULARIZADA, include=FALSE}
+
+#Ahora definiremos loes tres modelos: 
+
+# Lasso
+lasso_spec <- logistic_reg(penalty = tune(), mixture = 1) %>%
+  set_engine("glmnet")
+# Ridge
+ridge_spec <- logistic_reg(penalty = tune(), mixture = 0) %>%
+  set_engine("glmnet")
+# Elastic Net
+elastic_net_spec <- logistic_reg(penalty = tune(), mixture = tune()) %>%
+  set_engine("glmnet")
+
+# VALIDACIÓN CRUZADA
+heart_folds <- vfold_cv(heart_train, v = 5, strata = condition )
+
+# TUNING (red de hiperparametros)
+
+    # LASSO
+lasso_grid <- grid_regular(penalty(), levels = 20)
+lasso_tune <- tune_grid(
+  workflow() %>% add_model(lasso_spec) %>% add_recipe(heart_recipe),
+  resamples = heart_folds,
+  grid = lasso_grid)
+
+    # RIDGE
+penalty_param <- penalty(range = c(-6, 3), trans = log10_trans())
+ridge_grid <- grid_regular(penalty_param, levels = 20)
+#ridge_grid <- grid_regular(penalty(), levels = 20)
+ridge_tune <- tune_grid(
+  workflow() %>% add_model(ridge_spec) %>% add_recipe(heart_recipe),
+  resamples = heart_folds,
+  grid = ridge_grid)
+
+    # ELASTIC NET
+
+penalty_param <- penalty(range = c(-6, 3), trans = log10_trans())
+elastic_net_grid <- grid_regular(penalty_param, mixture(), levels = c(20, 5))
+#elastic_net_grid <- grid_regular(penalty(), mixture(), levels = c(20, 5))
+elastic_net_tune <- tune_grid(
+  workflow() %>% add_model(elastic_net_spec) %>% add_recipe(heart_recipe),
+  resamples = heart_folds,
+  grid = elastic_net_grid)
+```
+
+
+Tras realizar nuestros modelos de `Regresón Logística Regularizada` podemos hacer una comparación entre los tres modelos a partir de tres métricas:
+
+#### **Accuracy**: proporción de predicciones correctas. Proporción de cuántas veces el modelo predijo correctamente. Esperamos que el modelo esté haciendo buenas predicciones cuando toma valores muy cercanos a 1.
+  
+    a. Lasso Model: el valor de L1 incia en ~1e-08 es el 71% de sus predicciones son correctas,
+    y se mantiene así hasta que L1 alcanza un valor de 1e-02, cuando comienza a crecer la
+    proporción de predicciones correctas, alcanzando un máximo en un 90% de predicciones correctas, 
+    después de esto, disminuye drásticamente.
+    
+    b. Ridge Model: durante la primera parte de la gráfica, tenemos una alta proporción (< 0.8)
+    de predicciones correctas, hasta que llega a ~1e+0.1, donde comienza a disminuir la proporción, 
+    llegando a valores de 0.5.
+    
+    c. Elastic Net: a comparación de los otros dos modelos, aquí tenemos parte de las dos
+    regularizaciones (L1 y L2), así que cada línea de diferente color mostrará la proporción
+    de L1 que estuvo presente dentro de la evaluación. La recta naranja, tiene una mejor
+    proporción de predicciones correctas (~0.84), pero también es la que no tiene regularización
+    L1. En general podemos observar que conforme aumenta la proporción de L1
+    que tien el modelo, el valor de `accuracy` decrementa. Esto nos dice que el modelo Ridge,
+    hace un mejor papel en la predicción (para esta métrica).
+    
+####  **Brier class**: mide la calidad de las predicciones. Compara las probabilidades predichas por el modelo con el valor real. Esperamos que este valor sea muy cercano a 0, esto nos indicaría que el modelo está haciendo un buen trabajo.
+  
+    a. Lasso Model: el valor del Brier Score inicia en ~0.19, que en sí podemos pensar que no
+    es muy alto, pero, comparado con otros modelos realizados en clase y tareas (Brier Score
+    de 0.05), es considerablemente grande. Este valor se mantiene constante hasta que L1 toma 
+    valores de ~1e-0.2, donde hay una caída en este valor, llegando a un coeficiente de ~ 0.15, 
+    para despues crecer y llegar a 0.25. Este mínimo coincide cuando el valor accuracy también
+    toma mejores valores (0.8).
+    
+    b. Ridge Model: iniciamos con un valor de 0.20 y se mantiene constante hasta ~1e+0.1,
+    donde comienza a creer esta medida, lo que indica que las predicciones son  malas.
+    
+    c. Elastic Net: por otro lado, el modelo que tiene una mejor calidad en las predicciones
+    (Brier Class pequeño) es aquel que tiene una proporción de L1 = 0.25, con un valor en esta
+    métrica de ~0.16, con un mínimo que llega a ~0.125.
+
+####  **ROC-AUC**: esta curva nos muestra la relación que hay entre los verdaderos positivos y los falsos positivos. Valores cercanos a 1 indican un muy buen modelo, mientras que valores cercanos 0, son señalan de un bajo rendimiento en el modedlo.
+  
+    a. Lasso Model: en este modelo, iniciamos con un muy buen valor (0.9), el cual se mantiene 
+    conforme crece L1, hasta llegar a ~1e-0.2, donde, al igual que en las otras métricas,  toma
+    un mejor valor, para luego decaer. En conclusión sobre este modelo, esperamos que el mejor
+    modelo esté entre valores de L1 cercanos a 1e-0.2.
+    
+    b. Ridge Model: al igual que el modelo anterior, el valor bajo la curva es alto (0.9), hasta
+    que llegamos a ~1e+0.1, donde igualmente comienza a dismnuir el  valor de ROC-AUC, lo cual 
+    no  es lo ideal. En conclusión, esperamos que un buen modelo esté por debajo de un valor de L2
+    de ~1e+0.1.
+    
+    c. Elastic Net: por otro lado, para esta métrica,  el mejor modelo es aquel que tiene la
+    proporción de L1 de 1, seguido del modelo de proporción L1 = 0. En este caso, resulta
+    confuso qué modelo escoger.\newline
+
+```{r tuning result lasso, echo=FALSE}
+#   LASSO
+autoplot(lasso_tune) +
+  labs(title = "Lasso Model",
+       x = "Penalty (L1)",
+       y = "Metric")
+```
+
+```{r tuning result ridge, echo=FALSE}
+#   RIDGE
+autoplot(ridge_tune) +
+  labs(title = "Ridge Model",
+       x = "Penalty (L2)",
+       y = "Metric")
+```
+
+```{r tuning result, echo=FALSE}
+#   ELASTIC NET
+autoplot(elastic_net_tune) +
+  labs(title = "Lasso Model",
+       x = "Penalty (L1 y L2)",
+       y = "Metric")
+```
+
+
+Luego realizamos la evaluación de los modelos en el dataset de entrenamiento. Para poder comparar las tres técnicas obtuvimos las curvas ROC-AUC. Como se puede observar, en general, no son muy buenas y esto se debe a que se ocuparon solamente 6 datos para hacer la evaluación.
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# Seleccionar los mejores modelos
+best_lasso <- select_best(lasso_tune, metric = "roc_auc")
+best_ridge <- select_best(ridge_tune, metric = "roc_auc")
+best_elastic_net <- select_best(elastic_net_tune, metric = "roc_auc")
+
+# Fit models
+lasso_fit <- finalize_workflow(
+  workflow() %>% add_model(lasso_spec) %>% add_recipe(heart_recipe),
+  best_lasso) %>% 
+  fit(data = heart_train)
+
+ridge_fit <- finalize_workflow(
+  workflow() %>% add_model(ridge_spec) %>% add_recipe(heart_recipe),
+  best_ridge) %>% 
+  fit(data = heart_train)
+
+elastic_net_fit <- finalize_workflow(
+  workflow() %>% add_model(elastic_net_spec) %>% add_recipe(heart_recipe),
+  best_elastic_net) %>% 
+  fit(data = heart_train)
+
+
+# Generar predicciones
+    # LASSO
+predictions_lasso <- augment(lasso_fit, new_data = heart_test)
+metrics_result_lasso <- predictions_lasso %>%         # Calcular las métricas de evaluación
+  metrics(truth = condition, estimate = .pred_class)
+
+roc_curve_lasso <- predictions_lasso %>%        # Generar la curva ROC
+  roc_curve(truth = condition, .pred_ICM) %>%
+  autoplot() +
+  labs(title = "Lasso - ROC Curve")
+
+    # RIDGE
+
+predictions_ridge <- augment(ridge_fit, new_data = heart_test)
+metrics_result_ridge <- predictions_ridge %>%
+  metrics(truth = condition, estimate = .pred_class)
+
+roc_curve_ridge <- predictions_ridge %>%
+  roc_curve(truth = condition, .pred_control) %>%
+  autoplot() +
+  labs(title = "Ridge - ROC Curve")
+
+    # ELASTIC NET
+predictions_elastic <- augment(elastic_net_fit, new_data = heart_test)
+metrics_result_elastic <- predictions_elastic %>%
+  metrics(truth = condition, estimate = .pred_class)
+
+roc_curve_elastic <- predictions_elastic %>%
+  roc_curve(truth = condition, .pred_control) %>%
+  autoplot() +
+  labs(title = "Elastic Net - ROC Curve")
+
+## Metricas finales
+metrics_result_lasso
+metrics_result_ridge
+metrics_result_elastic
+
+
+roc_curve_lasso + roc_curve_ridge + roc_curve_elastic
+```
+
+
+La matrices de confusión nos permiten observas las predicciones que son correctas de las que no lo son, como mencionamos anteriormente, solo tenemos 6 datos, por lo que las tres matrices son iguales. Si tuviéramos más datos, sí esperaríamos ver diferencias entre los modelos.
+
+```{r matriz de confusion, echo=FALSE, message=FALSE, warning=FALSE}
+    # LASSO
+conf_mat_lasso <- predictions_lasso %>%
+  conf_mat(truth = condition, estimate = .pred_class)
+mc_lasso <- autoplot(conf_mat_lasso, type = "heatmap") +
+  scale_fill_gradient(low = "lightpink", high = "lightpink3") +
+  ggtitle("Lasso")
+
+    # RIDGE
+conf_mat_ridge <- predictions_ridge %>%
+  conf_mat(truth = condition, estimate = .pred_class)
+mc_ridge <- autoplot(conf_mat_ridge, type = "heatmap") +
+  scale_fill_gradient(low = "lightpink", high = "lightpink3") +
+  ggtitle("Ridge")
+
+    # ELASTIC NET
+conf_mat_elastic <- predictions_elastic %>%
+  conf_mat(truth = condition, estimate = .pred_class)
+mc_elastic <- autoplot(conf_mat_elastic, type = "heatmap") +
+  scale_fill_gradient(low = "lightpink", high = "lightpink3") +
+  ggtitle("Elastic Net")
+
+mc_lasso+mc_ridge+mc_elastic
+```
+
+
+En los siguientes plots podemos ver las variables que contribuyen más a cada uno de los modelos. Estos nos permitirán compararlos con las técnicas de Decision Tree y Random Forest.\newline\newline
+```{r importancia de variables, echo=FALSE}
+vip_plot <- function(model_fit, model_name) {
+  model_fit %>%
+    extract_fit_parsnip() %>%
+    vip() +
+    labs(title = paste(model_name, "- Variable Importance")) +
+    theme_minimal() +
+    geom_bar(stat = "identity", fill = "palevioletred2")}
+
+# Crear los gráficos de importancia de variables
+lasso_vip <- vip_plot(lasso_fit, "Lasso")
+ridge_vip <- vip_plot(ridge_fit, "Ridge")
+elastic_net_vip <- vip_plot(elastic_net_fit, "Elastic Net")
+
+# Mostrar los gráficos
+lasso_vip
+```
+
+```{r echo=FALSE}
+# plot de importancia de variables RIDGE
+ridge_vip
+```
+
+```{r echo=FALSE}
+# plot de importancia de variables ELASTIC NET
+elastic_net_vip
+```
+
+
+### **Decision Tree y Random Forest**
+
+Implementamos ambos modelos de clasificación.
+
+```{r include=FALSE}
+## Preparación de los datos
+
+##1. Separacion del data
+set.seed(123)
+data_split <- initial_split(final_data, prop = 0.75, strata = condition)
+data_train <- training(data_split)
+data_test <- testing(data_split)
+
+##2. Creando receta para la clasificación
+
+data_recipe <- recipe(condition ~ ., data = final_data) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors())
+
+##3. Crear un set de validación 
+
+set.seed(234)
+hf_folds <- vfold_cv(data_train, v = 5, strata = condition)
+```
+
+
+```{r include=FALSE}
+##Creando los modelos
+
+##1. Especifico los modelos
+dt_hf <- decision_tree() %>%
+  set_engine("rpart") %>%
+  set_mode("classification")
+
+rf_hf <- rand_forest() %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+
+##2. CRear un workflow para la clasificación
+dt_wflow <- workflow() %>%
+  add_recipe(data_recipe) %>%
+  add_model(dt_hf)
+
+rf_wflow <- workflow() %>%
+  add_recipe(data_recipe) %>%
+  add_model(rf_hf)
+
+##3. Ajustar el modelo de clasificación
+
+dt_res <- dt_wflow %>%
+  fit_resamples(
+    resamples = hf_folds,
+    metrics = metric_set(accuracy, roc_auc, kap),
+    control = control_resamples(save_pred = TRUE)
+  )
+
+rf_res <- rf_wflow %>%
+  fit_resamples(
+    resamples = hf_folds,
+    metrics = metric_set(accuracy, roc_auc, kap),
+    control = control_resamples(save_pred = TRUE))
+```
+
+Luego, evaluamos los modelos en base a sus métricas y observamos que **Random Forest** tiene un mejor desempeño al realizar las predicciones en comparación con **Decision Tree**.
+
+```{r echo=FALSE}
+##1. Comparando el desempeño del modelo
+bind_rows(
+  dt_res %>% collect_metrics() %>% mutate(model = "Decision Tree"),
+  rf_res %>% collect_metrics() %>% mutate(model = "Random Forest")
+) %>%
+  pivot_wider(names_from = .metric, values_from = mean) %>%
+  arrange(desc(accuracy))
+
+```
+
+
+En el modelo de **Random Forest** tenemos como variables importantes a varias rutas de **NABA_PROTEOGLYCANS**, **NABA_ECM_GLYCOPROTEINS**, **NABA_CORE_MATRISOME**, **NABA_MATRISOME**, etc. En el modelo de **Decision Tree** tenemos estas mismas cuatro al principio aunque en diferente orden, y otras dos rutas que no se encuentran en las variables de **Random Forest**. Estas rutas están altamente relacionadas con la estructura de la Matriz EXtracelular, esto se puede observar en los siguientes plots:
+
+```{r echo=FALSE}
+###variables random forest
+rf_wflow %>%
+  fit(data_train) %>%
+  pull_workflow_fit() %>%
+  vip(geom = "col", aesthetics = list(fill = "palevioletred2")) +
+  ggtitle("Random Forest - Importancia de Variables")
+
+```
+
+```{r echo=FALSE}
+##variables desicion tree
+dt_wflow %>%
+  fit(data_train) %>%
+  pull_workflow_fit() %>%
+  vip(geom = "col", aesthetics = list(fill = "palevioletred2")) +
+  ggtitle("Decision Tree - Importancia de Variables")
+
+```
+
+```{r echo=FALSE}
+##Ajustamos los mejores modelos de clasificación
+rf_final <- rf_wflow %>%
+  last_fit(data_split)
+
+rf_final %>% collect_metrics()
+
+dt_final <- dt_wflow %>%
+  last_fit(data_split)
+
+dt_final %>% collect_metrics()
+```
+
+
+En términos generales, parece ser que el modelo de **Random Forest** y el de **Decision Tree** tienen un desempeño similar. Sin embargo, es posible que observemos este resultado debido a la limitación en la cantidad de muestras del dataset. Con base en las métricas y si se tuviera un dataset más grande en cuanto al número de pacientes, se esperaría que **Random Forest** tuviera un mejor desempeño en la predicción en comparación con **Decision Tree**.
+
+```{r echo=FALSE}
+conf_mat_final_dt <- dt_final %>%
+  collect_predictions() %>%
+  conf_mat(truth = condition, estimate = .pred_class)
+
+mc_final_dt <- autoplot(conf_mat_final_dt, type = "heatmap") +
+  scale_fill_gradient(low = "lightpink", high = "lightpink3") +
+  ggtitle("Decision Tree")
+
+mc_final_dt
+```
+
+
+```{r echo=FALSE}
+conf_mat_rf <- rf_final %>%
+  collect_predictions() %>%
+  conf_mat(truth = condition, estimate = .pred_class)
+
+mc_final_rf <- autoplot(conf_mat_rf, type = "heatmap") +
+  scale_fill_gradient(low = "lightpink", high = "lightpink3") +
+  ggtitle("Random Forest")
+
+mc_final_rf
+```
+
+Para estos modelos optimizamos parámetros como tree depth o number of trees.\newline
+En las siguientes gráficas podemos observar el desempeño de el modelo en relación al valor de sus hiperparámetros.
+
+```{r echo=FALSE}
+##Son los mismos pasos que se llevaron a cabo antes, solo que ahora se ajusta el modelo con hiperparametros
+
+##Especificando los modelos con los hiperparametros
+set.seed(123)
+rf_params <- rand_forest(
+  mtry = tune(),  
+  trees = tune(), 
+  min_n = tune()  
+) %>%
+  set_engine("ranger") %>%
+  set_mode("classification")
+
+dt_params <- decision_tree(
+  cost_complexity = tune(),  
+  tree_depth = tune(),      
+  min_n = tune()            
+) %>%
+  set_engine("rpart") %>%
+  set_mode("classification")
+
+
+# Crear el flujo de trabajo para Random Forest
+rf_wflow_tune <- workflow() %>%
+  add_recipe(data_recipe) %>%
+  add_model(rf_params)
+
+# Crear el flujo de trabajo para Decision Tree
+dt_wflow_tune <- workflow() %>%
+  add_recipe(data_recipe) %>%
+  add_model(dt_params)
+
+hf_folds <- vfold_cv(data_train, v = 5, strata = condition)
+
+
+# Realizar la búsqueda de hiperparámetros para Random Forest
+# Crear la cuadrícula de búsqueda para el ajuste de hiperparámetros
+rf_grid <- grid_regular(
+  mtry(range = c(1, 10)),       
+  trees(range = c(100, 1000)),  
+  min_n(range = c(2, 10)),     
+  levels = 5                    
+)
+
+rf_tune <- tune_grid(
+  workflow() %>% add_model(rf_params) %>% add_recipe(data_recipe),
+  resamples = hf_folds,
+  grid = rf_grid
+)
+# Realizar la búsqueda de hiperparámetros para Decision Tree
+# Crear la cuadrícula de búsqueda para el ajuste de hiperparámetros en Decision Tree
+dt_grid <- grid_regular(
+  min_n(range = c(2, 10)),            
+  tree_depth(range = c(1, 20)), 
+  cost_complexity(range = c(-3, 0), trans = log10_trans()),
+  levels = 3                         
+)
+
+dt_tune <- tune_grid(
+  workflow() %>% add_model(dt_params) %>% add_recipe(data_recipe),
+  resamples = hf_folds,
+  grid = dt_grid
+)
+autoplot(dt_tune)
+```
+
+```{r echo=FALSE}
+autoplot(rf_tune)
+```
+
+
+Ahora seleccionaremos los mejores hiperparámetros, para **Random Forest** fueron: mtry = 1, trees = 1000 y min_n = 4; mientras que para **Decision Tree** fueron: cost_complexity = 0.001, tree_depth = 1 y min_n = 2.
+
+```{r echo=FALSE}
+# Seleccionar los mejores hiperparámetros para Random Forest
+best_rf_params <- select_best(rf_tune, metric = "roc_auc")
+# Seleccionar los mejores hiperparámetros para Decision Tree
+best_dt_params <- select_best(dt_tune, metric = "roc_auc")  # Puedes cambiar la métrica según lo que prefieras
+
+print(best_rf_params)
+print(best_dt_params)
+```
+
+Finalmente comparamos el desempeño de los modelos (ocupando los hiperparámetros ya seleccionados). Parece ser que nuevamente ambos modelos tienen un desempeño muy similar, y como se mencionó anteriormente es posible que sus predicciones pudieran variar si se tuvieran más muestras.
+
+```{r echo=FALSE}
+# Reajustar 
+rf_fit <- finalize_workflow(
+  workflow() %>% add_model(rf_params) %>% add_recipe(data_recipe),
+  best_rf_params) %>% 
+  fit(data = data_train)
+
+dt_fit <- finalize_workflow(
+  workflow() %>% add_model(dt_params) %>% add_recipe(data_recipe),
+  best_dt_params) %>% 
+  fit(data = data_train)
+
+
+##Graficando las metricas de los mejores parametros
+
+predictions_dt <- augment(dt_fit, new_data = data_test)
+metrics_dt <- predictions_dt %>%
+  metrics(truth = condition, estimate = .pred_class)
+
+roc_curve_dt <- predictions_dt %>%
+  roc_curve(truth = condition, .pred_control) %>%
+  autoplot() +
+  labs(title = "Decision Tree - ROC Curve")
+
+predictions_rf <- augment(rf_fit, new_data = data_test)
+metrics_rf <- predictions_rf %>%
+  metrics(truth = condition, estimate = .pred_class)
+
+roc_curve_rf <- predictions_rf %>%
+  roc_curve(truth = condition, .pred_control) %>%
+  autoplot() +
+  labs(title = "Random Forest - ROC Curve")
+
+roc_curve_dt + roc_curve_rf 
+
+
+
+```
+
+Por último, las matrices de confusión nos permiten observar las predicciones realizadas por ambos modelos. Nuevamente obtuvimos predicciones perfectas, esto también se debe a los pocos datos con los que se evaluó el modelo (dataset de prueba). 
+
+```{r matrices de confusion RF y DT, echo=FALSE, message=FALSE, warning=FALSE}
+# Comparar el desempeño de Random Forest
+
+conf_mat_rf <- predictions_rf %>%
+  conf_mat(truth = condition, estimate = .pred_class)
+mc_rf <- autoplot(conf_mat_rf, type = "heatmap") +
+  scale_fill_gradient(low = "lightpink", high = "lightpink3") +
+  ggtitle("Random Forest")
+
+conf_mat_dt <- predictions_dt %>%
+  conf_mat(truth = condition, estimate = .pred_class)
+mc_dt <- autoplot(conf_mat_dt, type = "heatmap") +
+  scale_fill_gradient(low = "lightpink", high = "lightpink3") +
+  ggtitle("Decision Tree")
+
+mc_dt+mc_rf
+```
+
+
+
+
+
+
+
+
+## **Ingeniería de características**
+
+#### **Describa su estrategia de selección/ingeniería de características.**\newline
+Dado que el final_data no contenía una gran cantidad de variables (pathways), como ocurría con el dataset inicial que incluía los transcritos, decidimos utilizar todas las variables como predictoras. Esta decisión se tomó considerando la posibilidad de que las variables importantes para explicar la variabilidad en el PCA no fueran necesariamente las mismas relevantes para la predicción de la condición de los pacientes. Como resultado se observó que las variables clave para cada análisis diferían.
+
+#### **Justificar la relevancia biológica de las características seleccionadas**\newline
+De manera general, la mayoría de los modelos incluyen rutas relacionadas con la estructura y función de la matriz extracelular (ECM). Como se ha mencionado, "La red de la matriz extracelular (ECM, por sus siglas en inglés) juega un papel crucial en la homeostasis cardíaca, no solo proporcionando soporte estructural, sino también facilitando la transmisión de fuerzas y transmitiendo señales clave a los cardiomiocitos, células vasculares y células intersticiales. Los cambios en el perfil y la bioquímica de la ECM pueden estar involucrados de manera crítica en la patogénesis tanto de la insuficiencia cardíaca con fracción de eyección reducida como de la insuficiencia cardíaca con fracción de eyección preservada' (Frangogiannis, 2019, traducido)".
+
+#### **Aborde la "maldición de la dimensionalidad" en los datos genómicos.**\newline
+La "maldición de la dimensionalidad" es un desafío inevitable al trabajar con datos genómicos, dados los miles de elementos que pueden analizarse, como genes, transcritos o proteínas. Esto debido al inmenso tamaño del genoma y la complejidad de sus interacciones. Aunque existen diferentes tipos de datos y enfoques para procesarlos, gran parte del tiempo se estará lidiando con un volumen masivo de variables. Dichos problemas los observamos tanto en el PCA como en los modelos antes de el uso de GSVA.
+
+#### **Explica cómo manejarás los " batch effects" o variaciones técnicas.**\newline
+Una forma en que se abordó este problema en este proyecto fue mediante un análisis exploratorio de los datos, particularmente observando el PCA. Se verificó que las agrupaciones de las muestras y las variables más relevantes del análisis fueran coherentes con el contexto biológico del estudio "ICM". Este proceso permitió detectar posibles "batch effects" como lo hubiera sido si las muestras se agrupaban de manera inesperada, lo cual podría indicar que la variación observada no estaba relacionada con las condiciones biológicas de los pacientes.\newline
+
+# **Parte 3: Revisión de la Literatura**
+
+## **Análisis de la literatura primaria**
+
+### **Clinical applications of machine learning in the diagnosis, classification, and prediction of heart failure**
+*Cameron R. Olsen, MD, a Robert J. Mentz, MD, a Kevin J. Anstrom, PhD, b David Page, PhD, b and Priyesh A. Patel, MDc Durham, and Charlotte, NC*
+
+#### **¿Cuál fue el objetivo principal y el enfoque?**\newline
+La relevancia clínica de este artículo de investigación se centra en el número de personas, en Estados Unidos, que son afectadas por algun tipo de insuficiencia cardíaca. Un diagnóstico a tiempo es clave, sin embargo las herramientas convencionales de predicción tiene un bajo rendimiento y pueden llegar a ser poco accesibles. Por lo anterior, es necesario implementar nuevos métodos y formas de diagnóstico, los cuales sean capaces de procesar grandes cantidades de datos clínicos. Ellxs propusieron un enfoque con Inteligencia Artificial (IA), ocupando Machine Learning, con enfoque supervisado y no supervisado, al igual que redes neuronales.
+
+#### **¿Cuáles fueron las principales innovaciones metodológicas?**\newline
+Hablando de la capacida de predicción de los modelos, estos algoritmos fueron capaces de diferenciar entre personas sanas y personas enfermas, incluso en un dataset pequeño. 
+
+Para la medicina de precisión, consdieramos que esta investigación tuvo las siguientes innovaciones:
+
+  a. Clasificación de tipos de  IC: se identificaron fenotipos específicos, lo que permitió clasificar las distinas condiciones de problemas cardíacos.
+
+  b. Respuesta a terapias: con técnicas supervisadas y de k-means, exploraron la capacidad de predicción de respuesta a diferentes terapias, como la  resincronización cardíaca y dispositivos de asistencia ventricular, en donde los resultados fueron prometedores.
+
+#### **¿Cómo validaron sus resultados?**\newline
+Solo mencionaremos dos modelos realizados en esta investigación:
+
+  a. Machine Learning para puntuación de riesgo: identificaron seis variables predictivas clave para realizar un puntaje de riesgo. Ocuparon métricas scomo AUC para evaluar el resultado, el cual tuvo un valor de 0.841, el cual lo podríamos considerar como un puntaje relativamente alto.
+  
+  b. Convolutional Neural Network: buscaron detectar disfunción ventricular. Para validar este modelo dividieron los datos en conjunto y entrenamiento, de aquí, las predicciones obtenidas fueron bastante buenas, esto lo podemos ver en la métria AUC, la cula  tuvo un puntaje de 0.93, el cual es bastante bueno.
+
+Por último, en otros tres modelos que realizaron, hicieron comparaciones con otras investigaciones.
+
+#### **¿Cuáles fueron las limitaciones**\newline
+Algunas de las limitaciones que notamos fueron:
+
+  a. Los datos ocuapdos para los estudios iniciales fueron limitados, lo que se podría ver reflejado en una falta de representación, lo que limitaría la capacidad del algoritmo para generalizar a poblaciones más grandes.
+  b. Igualmente consideramos que en la parte de validación, hubo resultados que no se validaron con información externa, sino que, apesar de que eran pocos datos, se limitaron a los resultados obtenidos.
+  c. La calidad y consistencia de los datos, como en los reportes de ecocardiografía y registros clínicos mencionados, pueden introducir ruido y sesgos en los modelos.
+
+#### **¿De qué manera su planteamiento es útil para su proyecto?**\newline
+Consideramos que este planteamiento es útil porque nos da la perspectiva de que es posible usar algoritmos de Machine Learning para hacer predicciones sobre insuficiencias cardíacas, ya que nuestros resultados no fueron tan prometedores como esperábamos; pero esta investigación mostró que sí es posible, pero con características y variable particulares.
+Además que también aborda este tema desde las Redes Neuronales, que creemos que dan otra pespectiva muy valiosa.
+
+
+
+### **Applications of artificial intelligence and machine learning in heart failure** 
+*Tauben Averbuch, Kristen Sullivan, Andrew Sauer, Mamas A Mamas, Adriaan A. Voors, Chris P. Gale, Marco Metra, Neal Ravindra,and Harriette G.C. Van Spal*
+
+#### **¿Cuál fue el objetivo principal y el enfoque?**\newline
+El objetivo principal de este artículo fue desarrollar un algoritmo de Deep Learning para predecir la mortalidad de pacientes con insuficiencia cardíaca aguda. Ocuparon información de 12 hospitales. El modelo se entrenó ocupando los datos de dos hospitales y se validó con información de diferentes hospitales de diferentes lugares.
+
+#### **¿Cuáles fueron las principales innovaciones metodológicas?**\newline
+Las características que notamos ded esta investigación fueron que se desarrollaron varios algoritmos, tanto de Machine Learning como de Deep Learning, lo que consideramos que hace da más robustez. Algunos de los modelos de MLS ocupados fueron: Random Forest, Regresión Logística, Máquinas de Soporte Vectorial y Redes Bayesianas.
+También es importante mencionar que se realizó un buen pre-procesamiento de los datos, además de que se realizaron varios conjuntos de entrenamiento, algo que solo notamos en este artículo. 
+
+#### **¿Cómo validaron sus resultados?**\newline
+Hubo varios puntos que se realizaron:
+  
+  a. Los datos ocupados para hacer la evaluación del modelo fueron independientes a los empleados para entrenar los modelos. Estos datos provenían de otros hospitales, centros y clínicas.\newline
+  
+  b. Los modelos desarrollados fueorn comparados con otros modelos de predicción que son más *convencionales* para evaluar la mortalidad de personas que tienen alguna insuficiencia cardíaca. Para estas comparaciones se ocupó la métrica ROC-AUC, la cual permite evaluar el rendimiento que tuvo el modelo de clasificación para distinguir entre las clases de la respuesta variable. El puntaje obtenido fue de:\newline
+    i. 0.88 para mortalidad hospitalaria.\newline
+    ii. 0.782 para mortalidad a los 12 meses.\newline
+    iii. 0.813 para mortalidad a los 36 meses.\newline\newline
+  En general; el ROC-AUC (mencionados anteriormente) de los modelos no convencionales superó al de los modelos convencionales.
+
+#### **¿Cuáles fueron las limitaciones**\newline
+Observamos algunas limitantes:
+
+  a. Para entrenar al modelo se le dio información de solamente dos hospitales, lo que creemos que podría haber una falta de representación de otros centros, en especial, si estos datos provienen de diferentes lugares. Incluso puede ser que las condiciones ambientales y/o sociales puedan influenciar en el momento en que se entrene el algoritmo.
+  
+  b. Durante la recolección de datos, se omitieron registros de pacientes que estuvieran incompletos; esto puede provocar que se excluyan características significativas.
+
+#### **¿De qué manera su planteamiento es útil para su proyecto?**\newline
+A pesar de que este enfoque no se alinee completamente con el planteado en nuestro proyecto final, coincidemos en que es crucial entender ćomo, en la actualidad, se están utilizando las herramientas de Inteligencia Artificial dentro del área de salud humana, en este caso, en cardiología. Examinar esta investigación nos permitió observar el proceso detallado de cómo implementar todas estas herramientas, desde la recolección y limpieza de datos hasta la selección de la información que se ocupará para entrenar los algoritmos de ML.
+
+
+### **Machine learning to identify a composite indicator to predict cardiac death in ischemic heart disease**
+*Alessandro Pingitore, Chenxiang Zhang, Cristina Vassalle, Paolo Ferragina, Patrizia Landi, Francesca Mastorci, Rosa Sicari, Alessandro Tommasi, Cesare Zavattari, Giuseppe Prencipe, Alina Sîrbu*
+
+#### **¿Cuál fue el objetivo principal y el enfoque?**\newline
+En el artículo se menciona cómo la *enfermedad isquémica del corazón* es una de las principales causas de muerte en el mundo. Sin embargo, esta enfermedad presenta diversas variables relacionadas, lo que dificulta identificar a los pacientes con alto riesgo. El objetivo de este estudio es utilizar *ML* para identificar a pacientes con enfermedad isquémica del corazón (EIC) que tienen un alto riesgo de muerte cardíaca (MC).
+
+#### **¿Cuáles fueron las principales innovaciones metodológicas?**\newline
+Para lograr esta meta, se utilizaron diversos métodos de *Machine Learning* combinados, formando así un modelo de ensamble, el cual mejora el rendimiento predictivo en comparación con los modelos individuales. Los modelos utilizados fueron los siguientes:
+
+  -  Regresión Logística (Logistic Regression, LR)
+  -  Bosques Aleatorios (Random Forest, RF)
+  -  Adaboost.
+    
+#### **¿Cómo validaron sus resultados?**\newline
+Los autores realizaron diversos análisis para validar sus modelos, pero uno que nos gustaría mencionar fue el uso de las curvas ROC-AUC. Este enfoque es similar al que utilizamos nosotras para validar nuestros modelos, ya que permite comparar y evaluar el desempeño de diferentes modelos en cuanto a su capacidad para clasificar correctamente los casos. A través de este análisis, los autores pudieron identificar qué modelo tenía un mejor desempeño y llegaron a la conclusión de que el modelo de ensamble.
+De este modo, al igual que nosotros, los autores utilizaron las curvas ROC para determinar cuál era el modelo más adecuado, observando cómo las predicciones de los modelos diferían en cuanto a precisión y capacidad de clasificación.
+
+#### **¿Cuáles fueron las limitaciones**\newline
+Los autores mencionan que los métodos de Machine Learning (ML) utilizados en el estudio resultaron ser “black-box methods” debido a que, aunque los modelos ofrecieron buenas predicciones, era complicado interpretar lo que realmente estaba sucediendo dentro del modelo. A pesar de contar con un buen desempeño predictivo, la falta de explicabilidad es una limitación importante en el uso de estos métodos. Otra limitación fue el uso de datos recolectados hace varios años, lo que impidió la inclusión de variables más recientes y relevantes que podrían haber mejorado el modelo. Finalmente, se excluyeron ciertos datos durante la fase de entrenamiento, lo que introdujo la posibilidad de sesgos, ya que la exclusión de información podría haber afectado la representatividad y la precisión del modelo.
+
+#### **¿De qué manera su planteamiento es útil para su proyecto?**\newline
+Este artículo es relevante para nuestro proyecto, ya que aborda varios aspectos clave que también hemos enfrentado. Al igual que nosotras, los autores utilizaron Random Forest (RF) y las métricas de ROC-AUC para evaluar el rendimiento de los modelos. También destacan cómo la exclusión de datos puede generar sesgos, un problema similar al que nos enfrentamos debido al tamaño reducido de nuestro conjunto de datos. Entender los procedimientos y desafíos que los autores superaron nos ayuda a manejar problemas similares y a interpretar mejor nuestros resultados.
+
+## **Comparación de Métodos**
+
+#### **Comparar y Contrastar Diferentes Enfoques de ML Utilizados en la Literatura.**\newline
+Sin duda, algo que se destaca al revisar estos artículos es que, aunque todos se enfocan en la insuficiencia cardíaca, abordan diferentes aspectos y objetivos dentro del campo. Algunos artículos se centran en predecir la presencia de condiciones específicas en pacientes, como la insuficiencia cardíaca, mientras que otros están más orientados a predecir el riesgo de muerte o el pronóstico de los pacientes con esta enfermedad. A pesar de los diferentes enfoques, el uso de métodos de ML está presentes en todos
+
+#### **Justificación del Método Elegido Basado en Esta Revisión.**\newline
+Un dato relevante es que, en dos de los artículos presentados, tanto Random Forest como Regresión Logística fueron utilizados como modelos principales para la predicción de insuficiencia cardíaca. Estos enfoques, ampliamente utilizados en la literatura, también demostraron un alto rendimiento en nuestro estudio, lo que resalta la efectividad de estos métodos para manejar datos en contextos clínicos y biológicos.
+
+#### **Identificación de Potenciales Mejoras sobre Enfoques Existentes.**\newline
+Consideramos que, dado que este es un tema ampliamente conocido y ya abordado en la literatura, el enfoque podría redirigirse principalmente hacia la identificación de los subtipos. Esta aproximación podría tener importantes implicaciones médicas, ya que un diagnóstico más preciso y específico de los subtipos permitiría un tratamiento más adecuado y personalizado para los pacientes, mejorando potencialmente los resultados clínicos.
+
+# **Parte 4: Resultados e Implementación**
+
+## **Aplicación Técnica**
+
+#### **Métricas de comparación entre distintas variaciones del modelo y compara con métodos existentes**\newline
+
+El mejor modelo que obtuvimos en Regresión Logística Regularizada fue **Elastic Net**, por lo que lo comparamos con **Decision Tree** y **Random Forest** para seleccionar el mejor modelo de entre los tres.
+
+Como podemos observar en las siguientes dos gráficas, en dos de tres modelos obtuvimos muy buenas métricas, tanto en Accuracy como en Kap. Esto se debe a los pocos datos con los que se entrenaron los modelos, y puede resultar confuso para escoger un único modelo. Para poder hacer descarte de modelos y seleccionar aquel que tenga un mejor rendimiento, es necesario evaluarlos en un conjunto de datos más grande. 
+En la revisión de literatura encontramos un artículo en donde realizaron un `modelo de ensamble`, en donde juntaron tres modelos diferentes; tal vez se pdoría hacer esto mismo pero con los tres modelos con mayor poder predictivo que obtuvimos.
+
+```{r echo=FALSE}
+# data frame con los valores de accuracy de los tres modelos
+accuracy_values2 <- tibble(
+  Model = c("Elastic Net", "Random Forest", "Decision Tree"),
+  Accuracy = c(
+    metrics_result_elastic %>% filter(.metric == "accuracy") %>% pull(.estimate),
+    metrics_rf %>% filter(.metric == "accuracy") %>% pull(.estimate),
+    metrics_dt %>% filter(.metric == "accuracy") %>% pull(.estimate)
+  )
+)
+
+# gráfico de barras
+accuracy_plot2 <- accuracy_values2 %>%
+  ggplot(aes(x = Model, y = Accuracy, fill = Model)) +
+  geom_bar(stat = "identity", width = 0.6) +  # Gráfico de barras
+  labs(
+    title = "Accuracy",
+    x = "Modelos",
+    y = "Accuracy"
+  ) +
+  theme_minimal(base_size = 14) +
+  scale_fill_brewer(palette = "Set2")  # Paleta de colores opcional
+
+# Mostrar el gráfico
+accuracy_plot2
+```
+
+
+```{r echo=FALSE}
+#  data frame con los valores de accuracy de los tres modelos
+# Crear un tibble con los valores de Kappa de los modelos
+kappa_values <- tibble(
+  Model = c("Elastic Net", "Random Forest", "Decision Tree"),
+  Kappa = c(
+    metrics_result_elastic %>% filter(.metric == "kap") %>% pull(.estimate),
+    metrics_rf %>% filter(.metric == "kap") %>% pull(.estimate),
+    metrics_dt %>% filter(.metric == "kap") %>% pull(.estimate)
+  )
+)
+
+# Gráfico de barras para Kappa
+kappa_plot <- kappa_values %>%
+  ggplot(aes(x = Model, y = Kappa, fill = Model)) +
+  geom_bar(stat = "identity", width = 0.6) +  # Gráfico de barras
+  labs(
+    title = "Kappa",
+    x = "Modelos",
+    y = "Kappa"
+  ) +
+  theme_minimal(base_size = 14) +
+  scale_fill_brewer(palette = "Set2")  # Paleta de colores opcional
+
+# Mostrar el gráfico
+kappa_plot
+
+```
+
+
+## **Análisis de resultados**
+
+#### **Interpretación biológica de los resultados**\newline
+Retomando los puntos previamente discutidos sobre las variables importantes, podemos concluir que, en la mayoría de los modelos, las rutas relacionadas con la estructura y función de la matriz extracelular (ECM) resultaron ser de suma importancia. Dado que una de las principales funciones de la ECM es proporcionar soporte estructural a las células, ayudándolas a mantener su forma y permitir que se organicen en un tejido funcional, esto podría estar vinculado a la miocardiopatía isquémica, en particular en lo que respecta a la estructura de las arterias, ya que esta condición reduce la capacidad del corazón para bombear sangre.
+
+#### **Discutir las limitaciones y posibles mejoras**\newline
+La principal limitación que tuvimos fue el número de datos que utilizamos (30 pacientes); esto lo vimos reflejado en  todos los modelos realizados, ya que las métricas de evaluación (por ejemplo: ROC-AUC) salían o muy buenas o muy malas, debido a que en el dataset de prueba había muy pocos datos.  De esta misma limitación podemos mencionar que en un número pequeño de datos es poco probable que se identifiquen patrones o relaciones entre las variables, lo que podría  cambiar la interpretación biológica; además que si decidiéramos escoger otro enfoque, como serían las Redes Neuronales, necesitaríamos muchos más datos, o incluso para un enfoque de Machine Learning no supervisado.
+
+El otro problema que encontramos durante el ajuste de hiperparámetros de los modelos de Random Forest (RF) y Decision Tree (DT) fue que las métricas obtenidas para estos modelos eran de 1, lo que nos llevó a plantear dos posibles explicaciones. Primero, que las variables utilizadas como predictoras pudieran estar demasiado correlacionadas con el outcome, lo que provocaría una predicción perfecta. La segunda posible explicación, que consideramos más probable debido al tamaño limitado del dataset, es que no se capturó toda la variabilidad de los datos. A partir de la matriz de correlación, supusimos que el problema podría deberse al tamaño de muestra.
+
+Una mejora sería recabar más información de pacientes que tengan cardiomaptía isquémica, esto nos permitirá generalizar los modelos y reducir el sesgo que hayamos obtenido. Probar nuevos (o cambios) modelos también podría ampliar nuestro cocnocimiento sobre esta área de la salud humana.
+
+## **Perspectiva biológica**
+
+#### **Explica los nuevos conocimientos biológicos adquiridos**\newline
+Aunque ya sabemos que la matriz extracelular (ECM) está relacionada con la miocardiopatía isquémica, identificar las rutas biológicas más asociadas nos permitirá comprender de manera más precisa cómo la ECM influye en el desarrollo y progresión de esta enfermedad. Este conocimiento más detallado podría ayudar a identificar mecanismos específicos de la ECM que podrían ser objetivos terapéuticos, mejorando así el enfoque en el tratamiento y diagnóstico de la miocardiopatía isquémica.
+
+#### **Discute potenicales aplicaciones clínicas o de investigación.**\newline
+Inicialmente no esperamos que nuestras prediccione se ocupen para hacer diagnósticos médicos, pero se pueden realizar para hacer una primera exploración sobre la salud del paciente. Permitirá identificar los pathways biológicos más relevantes y se podrían brindar terapias dirigidas, lo que aumentaría la efectividad del diagnóstico y del tratamiento.
+Del lado de investigación, la identificación de estas vías biológicas podría iniciar nuevos enfoques en el área farmacológica o explorar el campo de la terapias génicas.
+
+## **Futuras direcciones de investigación**\newline
+Inicialmente este dataset es de una población concreta, pero se puede expandir ocupando información de más pacientes de diferentes lugares, esto nos permitirá tomar en cuenta factores genómicos, ambientales e incluso sociales, que hagan al modelo más robusto.
+Con los resultados obtenidos, podemos explorar más sobre las principales pathways biológicas que están relacionadas con esta condición, para poder entender qué papel juegan e incluso pensar en alguna terapia a futuro.
+También podemos evaluar las predicciones de nuestros modelos en un contexto clínico real (no ocupar la predicciones para realizar una decisión médica), esto nos permitirá expandir el modelo y haceer un análisis más riguroso.
+
+
+# **Referencias**
+
+- Abel, E. D. (2021). Insulin signaling in the heart. American Journal of Physiology-Endocrinology and Metabolism, 321(1), E130–E145. https://doi.org/10.1152/ajpendo.00158.2021
+
+- Aoyagi, T., & Matsui, T. (2011). Phosphoinositide-3 kinase signaling in cardiac hypertrophy and heart failure. Current Pharmaceutical Design, 17(18), 1818–1824. https://doi.org/10.2174/138161211796390976
+
+- Averbuch, T., Sullivan, K., Sauer, A., Mamas, M. A., Voors, A. A., Gale, C. P., Metra, M., Ravindra, N., & Van Spall, H. G. C. (2022). Applications of artificial intelligence and machine learning in heart failure. European Heart Journal - Digital Health, 3(2), 311–322. https://doi.org/10.1093/ehjdh/ztac025
+
+- Frangogiannis, N. G. (2019). The extracellular matrix in ischemic and nonischemic heart failure. Circulation Research, 125(1), 117–146. https://doi.org/10.1161/CIRCRESAHA.119.311148
+
+- Kwon, J. M., Kim, K. H., Jeon, K. H., Lee, S. E., & Lee, H. Y. (2019). Artificial intelligence algorithm for predicting mortality of patients with acute heart failure. PLOS ONE, 14(7), e0219302. https://doi.org/10.1371/journal.pone.0219302
+
+- Pingitore, A., Zhang, C., Vassalle, C., Ferragina, P., Landi, P., Mastorci, F., Sicari, R., Tommasi, A., Zavattari, C., Prencipe, G., & Sîrbu, A. (2024). Machine learning to identify a composite indicator to predict cardiac death in ischemic heart disease. International Journal of Cardiology, 404, 131981. https://doi.org/10.1016/j.ijcard.2024.131981
+
+
+
+
+
+
+
+
+
+
+
+
