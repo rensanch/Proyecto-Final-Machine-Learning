@@ -77,7 +77,7 @@ El proyecto se divide en cuatro partes principales:
 
 _Este trabajo fue realizado por:_
 
-* **Renata Sandoval** - *Trabajo Inicial* - [villanuevand](https://github.com/rensanch)
+* **Renata Sandoval** - *Trabajo Inicial* - [rensanch](https://github.com/rensanch)
 * **Victoria Lelis** - *Trabajo Inicial* - [VictoriaLelis](https://github.com/VictoriaLelis)
 
 
